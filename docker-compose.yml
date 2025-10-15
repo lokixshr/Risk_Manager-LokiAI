@@ -1,0 +1,162 @@
+version: '3.8'
+
+services:
+  # Risk Manager Agent
+  risk-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: risk-manager-agent
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - ENV=production
+      - LOG_LEVEL=INFO
+      - ENABLE_REDIS=true
+      - REDIS_URL=redis://redis:6379/0
+      - MONGODB_URI=${MONGODB_URI}
+      - MONGO_DB_NAME=loki_agents_prod
+      - COINGECKO_API_KEY=${COINGECKO_API_KEY}
+      - ALCHEMY_API_KEY=${ALCHEMY_API_KEY}
+      - ALCHEMY_URL=${ALCHEMY_URL}
+      - ETHERSCAN_API_KEY=${ETHERSCAN_API_KEY}
+      - THEGRAPH_API_KEY=${THEGRAPH_API_KEY}
+      - LOKI_URL=http://loki:8000
+      - RISK_MANAGER_PORT=8001
+      - RATE_LIMIT_PER_MINUTE=60
+      - BACKGROUND_TASK_INTERVAL=600
+      - LIQUIDATION_THRESHOLD=1.0
+      - SAFETY_THRESHOLD=1.2
+      - VAR_CONFIDENCE=0.95
+      - VOLATILITY_WINDOW_DAYS=7
+      - MODEL_RETRAIN_HOURS=24
+      - MIN_TRAINING_SAMPLES=100
+    depends_on:
+      - redis
+      - mongodb
+    volumes:
+      - ./logs:/app/logs
+      - ./models:/app/models
+    networks:
+      - risk-manager-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/api/risk/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: risk-manager-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    command: >
+      --requirepass ${REDIS_PASSWORD:-defaultpassword}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - risk-manager-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # MongoDB (for development - use managed service in production)
+  mongodb:
+    image: mongo:7
+    container_name: risk-manager-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_ROOT_USER:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-password}
+      MONGO_INITDB_DATABASE: loki_agents_prod
+    volumes:
+      - mongodb_data:/data/db
+      - ./scripts/mongo-init.js:/docker-entrypoint-initdb.d/mongo-init.js:ro
+    networks:
+      - risk-manager-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: risk-manager-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./logs/nginx:/var/log/nginx
+    depends_on:
+      - risk-manager
+    networks:
+      - risk-manager-network
+
+  # Prometheus Monitoring
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: risk-manager-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - risk-manager-network
+
+  # Grafana Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: risk-manager-grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - risk-manager-network
+
+volumes:
+  redis_data:
+    driver: local
+  mongodb_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  risk-manager-network:
+    driver: bridge
